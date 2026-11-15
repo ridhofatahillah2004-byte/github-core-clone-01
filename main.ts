@@ -20,9 +20,9 @@ const FLUSH_PKT = Buffer.from("0000", "ascii");
 const DELIM_PKT = Buffer.from("0001", "ascii");
 
 type PktItem =
-  | { kind: "data"; data: Buffer }
-  | { kind: "flush" }
-  | { kind: "delim" };
+  | { kind: "data"; data: Buffer; start: number; end: number }
+  | { kind: "flush"; start: number; end: number }
+  | { kind: "delim"; start: number; end: number };
 
 function readPktLines(buf: Buffer): PktItem[] {
   const out: PktItem[] = [];
@@ -31,17 +31,18 @@ function readPktLines(buf: Buffer): PktItem[] {
     const len = parseInt(buf.toString("ascii", pos, pos + 4), 16);
     if (!Number.isFinite(len) || len < 0) break;
     if (len === 0) {
-      out.push({ kind: "flush" });
+      out.push({ kind: "flush", start: pos, end: pos + 4 });
       pos += 4;
       continue;
     }
     if (len === 1) {
-      out.push({ kind: "delim" });
+      out.push({ kind: "delim", start: pos, end: pos + 4 });
       pos += 4;
       continue;
     }
     if (pos + len > buf.length) break;
-    out.push({ kind: "data", data: Buffer.from(buf.subarray(pos + 4, pos + len)) });
+    // A view, not a copy: no caller mutates an item's payload.
+    out.push({ kind: "data", data: buf.subarray(pos + 4, pos + len), start: pos, end: pos + len });
     pos += len;
   }
   return out;
@@ -86,19 +87,52 @@ function unwrapStatelessRpc(body: Buffer): Buffer {
 // ===========================================================================
 // sha1 + zlib
 // ===========================================================================
-function sha1Hex(data: Buffer): string {
-  return createHash("sha1").update(data).digest("hex");
-}
 function sha1Buf(data: Buffer): Buffer {
   return createHash("sha1").update(data).digest();
 }
 
+/** Adler-32, the checksum a zlib stream ends with; chunked so big buffers stay fast. */
+function adler32(buf: Buffer): number {
+  let a = 1;
+  let b = 0;
+  const NMAX = 5552;
+  for (let off = 0; off < buf.length; off += NMAX) {
+    const end = Math.min(buf.length, off + NMAX);
+    for (let i = off; i < end; i++) {
+      a += buf[i];
+      b += a;
+    }
+    a %= 65521;
+    b %= 65521;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
 /**
  * Inflate the zlib stream starting at `start`; returns the data and the offset
- * just past the stream. inflateSync ignores trailing bytes, so the smallest
- * prefix that inflates cleanly is exactly the stream end (binary search).
+ * just past the stream. inflateSync ignores trailing bytes, so one call yields
+ * the data; the stream's end is the 4-byte Adler-32 checksum that follows the
+ * deflate data, found by scanning for it and verified with one exact-prefix
+ * inflate (a coincidental match inside the deflate data is ~1e-7 per object).
+ * Falls back to the old binary search when no candidate verifies (never on a
+ * well-formed pack). Throws on a corrupt stream, exactly as before — but the
+ * common path throws nothing, where the binary search threw ~log2(n) times
+ * per object (each throw pays a full stack capture).
  */
 function inflateExact(buf: Buffer, start: number): { data: Buffer; next: number } {
+  const data = inflateSync(buf.subarray(start));
+  const adler = adler32(data);
+  // The earliest the Adler-32 can start: 2-byte zlib header + deflate data.
+  for (let pos = start + 2; pos + 4 <= buf.length; pos++) {
+    if (buf.readUInt32BE(pos) !== adler) continue;
+    const end = pos + 4;
+    try {
+      const check = inflateSync(buf.subarray(start, end));
+      if (check.length === data.length && check.equals(data)) return { data, next: end };
+    } catch {
+      // Not the real end (a coincidental match inside the deflate data); keep scanning.
+    }
+  }
   let lo = start + 1;
   let hi = buf.length;
   let ans = -1;
@@ -124,12 +158,15 @@ const OBJ_TYPE_CODE: Record<ObjType, number> = { commit: 1, tree: 2, blob: 3, ta
 const OBJ_CODE_TYPE: Record<number, ObjType> = { 1: "commit", 2: "tree", 3: "blob", 4: "tag" };
 
 function hashObject(type: ObjType, data: Buffer): string {
-  return sha1Hex(Buffer.concat([Buffer.from(`${type} ${data.length}\0`, "utf8"), data]));
+  // Two updates instead of Buffer.concat: the same SHA-1 without copying data.
+  return createHash("sha1").update(`${type} ${data.length}\0`, "utf8").update(data).digest("hex");
 }
 
 interface GitObject {
   type: ObjType;
   data: Buffer;
+  /** The object's id, set by readPack (the pack reader hashes every object once). */
+  oid?: string;
 }
 
 interface ParsedCommit {
@@ -305,6 +342,7 @@ function readPack(buf: Buffer): GitObject[] {
       obj = { type, data };
     }
     const oid = hashObject(obj.type, obj.data);
+    obj.oid = oid;
     objects.push(obj);
     byOffset.set(objStart, obj);
     byOid.set(oid, obj);
@@ -510,6 +548,8 @@ interface Issue {
   updatedAt: string;
   closedAt: string | null;
   comments: { id: number; body: string; user: string; createdAt: string }[];
+  /** Cached JSON.stringify(issueJson(...)) for this issue; cleared on any mutation. */
+  _json?: string;
 }
 
 interface Pull {
@@ -606,6 +646,21 @@ function sendJson(
   res.end(body);
 }
 
+/** Like sendJson, but the body is already a JSON string (no second stringify). */
+function sendJsonText(
+  res: http.ServerResponse,
+  status: number,
+  json: string,
+  extra: Record<string, string> = {},
+): void {
+  res.writeHead(status, {
+    "content-type": "application/json",
+    "x-github-request-id": `req-${++requestCounter}`,
+    ...extra,
+  });
+  res.end(json);
+}
+
 function sendError(res: http.ServerResponse, status: number, message: string): void {
   sendJson(res, status, { message });
 }
@@ -634,7 +689,7 @@ function readBody(req: http.IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
-    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("end", () => resolve(chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)));
     req.on("error", reject);
   });
 }
@@ -860,11 +915,9 @@ function fetchPack(
       const parents = parseCommit(obj.data).parents;
       if (parents.every((p) => sendCommits.has(p) || held.has(p))) unshallows.push(s);
     }
-    const sorted = [...objects.values()].sort((a, b) => {
-      const ao = hashObject(a.type, a.data);
-      const bo = hashObject(b.type, b.data);
-      return ao < bo ? -1 : ao > bo ? 1 : 0;
-    });
+    const sorted = [...objects.entries()]
+      .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+      .map(([, obj]) => obj);
     return { pack: writePack(sorted), shallows: [...boundary].sort(), unshallows };
   }
   const haveSet = new Set<string>();
@@ -873,11 +926,11 @@ function fetchPack(
     for (const oid of reached.keys()) haveSet.add(oid);
   }
   const wanted = collectReachable(repo.objects, wants, haveSet, false);
-  const objects = [...wanted.values()].sort((a, b) => {
-    const ao = hashObject(a.type, a.data);
-    const bo = hashObject(b.type, b.data);
-    return ao < bo ? -1 : ao > bo ? 1 : 0;
-  });
+  // The map is keyed by oid, so sorting by key is sorting by oid — the same
+  // order the old comparator produced by re-hashing every object per compare.
+  const objects = [...wanted.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([, obj]) => obj);
   return { pack: writePack(objects), shallows: [], unshallows: [] };
 }
 
@@ -1034,47 +1087,28 @@ function handleReceivePack(repo: Repo, body: Buffer): Buffer {
   const cmds: Cmd[] = [];
   let useSideband = false;
   let reportStatus = false;
+  // One pass over the parsed lines: the commands and caps come from the items
+  // themselves, and the pack starts just past the flush pkt-line that ends
+  // the command section (the item's recorded end offset). With no flush at
+  // all packStart stays 0, as the old re-walk left it.
   let packStart = 0;
-  // Find the flush that ends the command section; the pack follows it.
-  let flushIndex = -1;
   for (let i = 0; i < items.length; i++) {
-    if (items[i].kind === "flush") {
-      flushIndex = i;
+    const item = items[i];
+    if (item.kind === "flush") {
+      packStart = item.end;
       break;
     }
-  }
-  // Re-walk the raw buffer to locate the byte offset just past the flush pkt.
-  {
-    let pos = 0;
-    let idx = 0;
-    while (pos + 4 <= stream.length && idx <= flushIndex) {
-      const len = parseInt(stream.toString("ascii", pos, pos + 4), 16);
-      if (len === 0) {
-        pos += 4;
-        idx++;
-        if (idx > flushIndex) break;
-        continue;
-      }
-      if (len === 1) {
-        pos += 4;
-        idx++;
-        continue;
-      }
-      if (pos + len > stream.length) break;
-      const payload = stream.toString("utf8", pos + 4, pos + len).replace(/\n$/, "");
-      if (idx === 0) {
-        const nul = payload.indexOf("\0");
-        const caps = nul === -1 ? "" : payload.slice(nul + 1);
-        if (caps.includes("side-band-64k")) useSideband = true;
-        if (caps.includes("report-status")) reportStatus = true;
-      }
-      const first = payload.split("\0")[0];
-      const m = first.match(/^([0-9a-f]{40}) ([0-9a-f]{40}) (\S+)$/);
-      if (m) cmds.push({ oldOid: m[1], newOid: m[2], ref: m[3] });
-      pos += len;
-      idx++;
+    if (item.kind !== "data") continue;
+    const payload = item.data.toString("utf8").replace(/\n$/, "");
+    if (i === 0) {
+      const nul = payload.indexOf("\0");
+      const caps = nul === -1 ? "" : payload.slice(nul + 1);
+      if (caps.includes("side-band-64k")) useSideband = true;
+      if (caps.includes("report-status")) reportStatus = true;
     }
-    packStart = pos;
+    const first = payload.split("\0")[0];
+    const m = first.match(/^([0-9a-f]{40}) ([0-9a-f]{40}) (\S+)$/);
+    if (m) cmds.push({ oldOid: m[1], newOid: m[2], ref: m[3] });
   }
   // Extract the packfile. In stateless RPC the pack arrives as plain
   // pkt-lines (send_sideband band=-1) after the command flush, or as raw
@@ -1110,7 +1144,8 @@ function handleReceivePack(repo: Repo, body: Buffer): Buffer {
   }
   if (unpackOk) {
     for (const o of newObjects) {
-      repo.objects.set(hashObject(o.type, o.data), o);
+      // readPack already hashed each object once; reuse its oid.
+      repo.objects.set(o.oid ?? hashObject(o.type, o.data), o);
     }
     for (const cmd of cmds) {
       const current = repo.refs.get(cmd.ref);
@@ -1259,6 +1294,27 @@ function issueJson(r: Repo, i: Issue): Record<string, unknown> {
     closed_at: i.closedAt,
     author_association: "OWNER",
   };
+}
+
+/**
+ * The issue's JSON body as a string, cached on the issue: the read workload
+ * GETs one unchanged issue thousands of times, and rebuilding + stringifying
+ * the same object every time is pure waste. The string is byte-identical to
+ * JSON.stringify(issueJson(r, i)) — it is built by exactly that — so a
+ * cached read answers what a fresh build would. Every mutation of the issue
+ * (REST PATCH, comment add, label add, GraphQL close/addComment) clears it,
+ * and any change to the repo's label definitions clears every issue's (the
+ * labels' color/description are embedded in the JSON).
+ */
+function issueJsonString(r: Repo, i: Issue): string {
+  if (i._json === undefined) i._json = JSON.stringify(issueJson(r, i));
+  return i._json;
+}
+function invalidateIssueJson(i: Issue): void {
+  i._json = undefined;
+}
+function invalidateRepoIssueJson(r: Repo): void {
+  for (const i of r.issues.values()) i._json = undefined;
 }
 
 function pullJson(r: Repo, p: Pull): Record<string, unknown> {
@@ -1593,6 +1649,8 @@ function handleRest(ctx: RestCtx): boolean {
           description: typeof b.description === "string" ? b.description : "",
         };
         repo.labels.set(name, label);
+        // A label definition changed: every cached issue JSON embeds it.
+        invalidateRepoIssueJson(repo);
         sendJson(res, 201, {
           id: 0,
           node_id: "",
@@ -1676,7 +1734,7 @@ function handleRest(ctx: RestCtx): boolean {
       }
       const sub = issueMatch[2] ?? "";
       if (method === "GET" && sub === "") {
-        sendJson(res, 200, issueJson(repo, issue));
+        sendJsonText(res, 200, issueJsonString(repo, issue));
         return true;
       }
       if (method === "PATCH" && sub === "") {
@@ -1698,6 +1756,7 @@ function handleRest(ctx: RestCtx): boolean {
           issue.labels = labels;
         }
         issue.updatedAt = isoNow();
+        invalidateIssueJson(issue);
         sendJson(res, 200, issueJson(repo, issue));
         return true;
       }
@@ -1730,6 +1789,7 @@ function handleRest(ctx: RestCtx): boolean {
           };
           issue.comments.push(comment);
           issue.updatedAt = isoNow();
+          invalidateIssueJson(issue);
           sendJson(res, 201, {
             id: comment.id,
             node_id: `C_${comment.id}`,
@@ -1756,6 +1816,7 @@ function handleRest(ctx: RestCtx): boolean {
           if (!issue.labels.includes(l)) issue.labels.push(l);
         }
         issue.updatedAt = isoNow();
+        invalidateIssueJson(issue);
         sendJson(
           res,
           200,
@@ -3034,6 +3095,7 @@ function execMutation(
     issue.state = "closed";
     issue.closedAt = isoNow();
     issue.updatedAt = isoNow();
+    invalidateIssueJson(issue);
     const out: { [key: string]: GqlValue } = {};
     for (const sub of expandSelection(f.selection, fragments)) {
       if (sub.name === "issue") {
@@ -3055,6 +3117,7 @@ function execMutation(
     };
     issue.comments.push(comment);
     issue.updatedAt = isoNow();
+    invalidateIssueJson(issue);
     const out: { [key: string]: GqlValue } = {};
     for (const sub of expandSelection(f.selection, fragments)) {
       if (sub.name === "commentEdge") {
